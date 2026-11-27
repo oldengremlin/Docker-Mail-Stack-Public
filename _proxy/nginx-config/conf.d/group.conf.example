@@ -1,0 +1,62 @@
+# Приклад vhost для однієї групи. Копіювати як <group>.conf (ім'я файлу
+# довільне, аби з .conf — nginx вантажить із conf.d усе за маскою *.conf,
+# тому цей файл із суфіксом .example не підхоплюється) і замінити
+# плейсхолдери:
+#   {GROUP}            — тут ДОВІЛЬНЕ: це лише мітка upstream-блоку,
+#                        видима тільки в межах цього файлу. Зручно
+#                        тримати таким самим, як ім'я групи, але ніщо
+#                        цього не вимагає.
+#   {INTERNAL_PREFIX}  — НЕ довільне: рівно те, що в group.env цієї групи
+#   {WEBMAIL_FQDN}     — НЕ довільне: реальне ім'я з DNS, за яким
+#                        користувачі відкривають вебмейл (воно ж має
+#                        збігатися з іменем у сертифікаті)
+#
+# Апстрим — статична адреса Roundcube у internal-мережі групи
+# ({INTERNAL_PREFIX}.50). Можна було б за іменем, АЛЕ: коли nginx
+# підключений до internal кількох груп, ім'я `roundcube` стає
+# неоднозначним — такий alias зареєстрований у кожній групі, і DNS
+# поверне будь-який з них. Однозначні варіанти — статична адреса (як
+# тут) або повне ім'я контейнера ({GROUP}-roundcube), не голе `roundcube`.
+
+upstream {GROUP}_webmail {
+    server {INTERNAL_PREFIX}.50:80;
+}
+
+server {
+    listen 80;
+    server_name {WEBMAIL_FQDN};
+
+    # Якщо оберемо HTTP-01 через webroot — сюди складає виклики certbot.
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name {WEBMAIL_FQDN};
+
+    ssl_certificate     /etc/letsencrypt/live/{WEBMAIL_FQDN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{WEBMAIL_FQDN}/privkey.pem;
+
+    location / {
+        proxy_pass http://{GROUP}_webmail;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # без цього Roundcube генеруватиме http:// посилання за https://
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # вкладення
+    client_max_body_size 25m;
+}
+
+# TODO перевірити на живому стенді: Roundcube за проксі має довіряти
+# X-Forwarded-* , інакше в логах буде IP проксі замість клієнтського.
+# Опція в конфізі Roundcube, точну назву звірити з версією образу.

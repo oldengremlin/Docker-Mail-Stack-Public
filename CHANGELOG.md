@@ -1,0 +1,27 @@
+# Changelog
+
+This repository receives periodic exports from a private working
+repository (see "About this repository" in the README). Each entry here is
+one export; `.public-sync/state` holds the exact source revision.
+
+## Export 1 — 2026-11-27
+
+First public export. The stack as it runs in production for several
+groups:
+
+- Postfix 3.10 with postscreen, submission, `anvil` limits, policies in
+  SQL (recipient-domain blocking, time-limited abuse blocks, aliases),
+  backup MX for any group;
+- Dovecot 2.4 (IMAP, POP3, ManageSieve, LMTP), login by short name or
+  email, ARGON2ID for new passwords, compatibility with migrated hashes;
+- OpenDKIM (keys generated automatically), OpenDMARC, ClamAV and
+  SpamAssassin as milters, per-user Bayes learning from IMAP moves;
+- Postgrey, Roundcube 1.7 with password change, ManageSieve,
+  mark-as-junk and per-user SpamAssassin preferences;
+- Let's Encrypt via HTTP-01 or DNS-01 (Cloudflare, CNAME delegation);
+- `mailctl`: validation, generation of per-group Compose fragments,
+  health checks, user/domain/alias/policy/block management, DNS records.
+
+Removed from the export: a site-specific integration (daily report
+forwarding via `vnd.dovecot.execute`), migration tooling for the original
+servers, and a DNS check script for specific domains.

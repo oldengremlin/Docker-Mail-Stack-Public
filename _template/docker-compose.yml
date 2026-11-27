@@ -1,0 +1,743 @@
+# ─────────────────────────────────────────────────────────────
+#  Шаблон ОДНІЄЇ повністю ізольованої mail-групи.
+#  Запускати як окремий compose-проєкт на кожну групу доменів:
+#
+#    docker compose -p <group> --env-file ../groups/<group>/group.env \
+#        -f docker-compose.yml up -d
+#
+#  Завдяки -p <group> Docker Compose сам namespace-ить
+#  volumes/networks під проєкт (corp_vmail-data, corp_mailnet-internal...),
+#  тож групи одна одній не заважають навіть з однаковим шаблоном.
+#  container_name/hostname явно параметризовані ${GROUP_NAME}-ом
+#  для читабельності `docker ps` при кількох групах на хості.
+# ─────────────────────────────────────────────────────────────
+
+# ── Єдина таблиця імен групи ──────────────────────────────────
+# `x-group-hosts` — довільна назва якоря, ні з чим поза цим файлом не
+# пов'язана; на неї посилається тільки `<<: *group-hosts` нижче.
+#
+# Правило: БУДЬ-ЯКИЙ сервіс звертається до будь-якого іншого ТІЛЬКИ за
+# іменем. Ніяких 127.0.0.1 у конфігах, ніяких "тут ім'я, а тут адреса".
+#
+# Чому не покладаємось лише на вбудований DNS Docker:
+#   - postfix/mysql/opendkim/opendmarc/postgrey/spamassassin підключені до
+#     мережі `internal` і резолвляться вбудованим DNS (127.0.0.11) штатно;
+#   - dovecot і roundcube НЕ підключені до жодної мережі (вони сидять у
+#     netns постфікса), тому в Docker DNS їх немає ВЗАГАЛІ — ані з
+#     internal, ані зсередини самого netns. Єдиний спосіб дати їм ім'я —
+#     статичний запис у /etc/hosts.
+#
+# Чому запис лише на postfix, а не на кожному сервісі:
+#   контейнер із network_mode: service:X не має власних /etc/hosts,
+#   /etc/resolv.conf, /etc/hostname — демон підставляє йому файли
+#   власника netns. Тому extra_hosts на dovecot/roundcube — не просто
+#   зайве, а ПОМИЛКА запуску ("conflicting options: custom host-to-IP
+#   mapping and the network mode"), а extra_hosts на postfix діють
+#   одразу на всі три контейнери.
+#
+# dovecot/roundcube вказують на internal-адресу постфікса (а не на
+# 127.0.0.1) свідомо: тоді одне й те саме ім'я дає робочу адресу і
+# зсередини спільного netns, і з будь-якого контейнера на internal.
+# Часовий пояс контейнерів. Без нього все падає в UTC, і кожне звіряння
+# `docker logs` з логами хоста вимагає арифметики в голові. На `Date:`
+# у листах це не впливає — його ставить клієнт; впливає на `Received:`,
+# на логи всіх демонів і на те, як MariaDB ВІДДАЄ timestamp-стовпці
+# (самі дані від цього не змінюються: TIMESTAMP зберігається в UTC і
+# конвертується при читанні, а DATETIME у наших схемах не
+# використовується).
+#
+# Дефолт UTC, тобто без рядка в group.env поведінка та сама, що була.
+# Ціна локальної зони — стрибок на годину двічі на рік при переході на
+# літній час; ціна UTC — та сама арифметика щоразу.
+x-tz: &tz
+  TZ: ${TZ:-UTC}
+
+x-group-hosts: &group-hosts
+  extra_hosts:
+    # ── спільний netns postfix+dovecot (одна IP на два сервіси) ──
+    - "postfix:${INTERNAL_PREFIX}.10"
+    - "dovecot:${INTERNAL_PREFIX}.10"
+    # FQDN групи вказує туди ж: коли додамо TLS, Roundcube ходитиме на
+    # tls://${MAIL_HOSTNAME}, щоб CN сертифіката збігався з іменем.
+    - "${MAIL_HOSTNAME}:${INTERNAL_PREFIX}.10"
+    # ── окремі контейнери на internal ──
+    - "mysql:${INTERNAL_PREFIX}.20"
+    - "opendkim:${INTERNAL_PREFIX}.30"
+    - "opendmarc:${INTERNAL_PREFIX}.31"
+    - "postgrey:${INTERNAL_PREFIX}.32"
+    - "spamassassin:${INTERNAL_PREFIX}.33"
+    - "clamav:${INTERNAL_PREFIX}.34"
+    # .40 — резерв. certbot адреси тут НЕ має свідомо: він одноразовий і
+    # запускається `mailctl certs` у netns постфікса, бо перевірка
+    # HTTP-01 мусить прийти на адресу групи, а вона належить постфіксу.
+    - "roundcube:${INTERNAL_PREFIX}.50"
+
+networks:
+  # внутрішня мережа групи — MySQL/Dovecot/OpenDKIM/OpenDMARC/Postgrey/
+  # SpamAssassin/ClamAV/Roundcube.
+  # НІКОЛИ не світиться назовні, тільки Postfix має сюди й назовні одночасно доступ.
+  #
+  # Підмережа виводиться з ${INTERNAL_PREFIX} — окремої змінної під CIDR
+  # свідомо НЕМАЄ. Маска /24 на групу зафіксована рішенням (README, "Чому
+  # /24 на групу"), а дві змінні, які мусять узгоджуватись між собою, — це
+  # заготовлений баг: підмережа й таблиця імен розійшлись би непомітно.
+  # Хочеш іншу маску — міняти тут, в одному місці, свідомо.
+  #
+  # ${INTERNAL_PREFIX} має бути УНІКАЛЬНИМ на групу: дві групи з однаковим
+  # третім октетом — і Docker відмовиться створити другу мережу
+  # (overlapping subnet). Явна підмережа потрібна, бо без неї не можна
+  # призначити статичні ipv4_address, а без них — побудувати таблицю імен.
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${INTERNAL_PREFIX}.0/24
+
+  # ЗОВНІШНІ мережі групи тут НЕ оголошені — їх додає згенерований
+  # фрагмент `groups/<group>/networks.yml`, який `mailctl` домержує
+  # другим `-f`. Причина в тому, що їх КІЛЬКА і набір різний у різних
+  # груп (рішення №27 і №29): у small одна публічна адреса, у office ще
+  # й сіра офісна. Compose не вміє циклів, тож статичним шаблоном
+  # змінну кількість підключень не описати.
+  #
+  # Самі мережі створює `mailctl net up` з `host.json` — вони спільні на
+  # хост, бо Docker не дає двох ipvlan/macvlan на один батьківський
+  # інтерфейс (рішення №24).
+  #
+  # Наслідок: цей файл НЕ піднімається самим `docker compose` без
+  # фрагмента — postfix лишиться без зовнішніх адрес. Підіймати тільки
+  # через `mailctl up`.
+
+volumes:
+  mysql-data:
+  postfix-spool:
+  postfix-data:
+  vmail-data:
+  dkim-keys:
+  postgrey-db:
+  # spamassassin-state ТУТ БІЛЬШЕ НЕ ПОТРІБЕН і прибраний свідомо:
+  # bayes, AWL і userpref живуть у SQL (рішення №33), як і на джерелах.
+  # Том зі станом поруч із базою означав би два місця, де лежить те
+  # саме, і одного дня вони розійшлися б мовчки.
+
+  # База вірусів ClamAV. Том, а не шар образу: вона важить близько
+  # гігабайта й оновлюється щодня, тож в образі була б застарілою з дня
+  # збірки. Груповий, а не спільний на хост — рішення №32.
+  clamav-db:
+  # Сертифікат групи. Том, а не каталог у шарі контейнера, бо до нього
+  # пишуть ТРИ сторони: entrypoint постфікса і dovecot (самопідписана
+  # заглушка, поки сертифіката немає) і `mailctl certs`, який кладе сюди
+  # випущений certbot-ом. Том груповий, а не хостовий: група бачить лише
+  # свій приватний ключ (рішення №4).
+  #
+  # Імена файлів — `fullchain.pem` і `privkey.pem`, рівно ті, якими їх
+  # називає certbot. Отже доставка сертифіката — просте копіювання, без
+  # перейменувань, у яких легко помилитись і важко помітити.
+  tls-certs:
+  # Тимчасові файли Roundcube: вкладення, що їх користувач уже
+  # завантажив у недописаний лист, і прев'ю. Том, а не шар контейнера:
+  # інакше `mailctl reload` знищував би недописані листи з вкладеннями,
+  # і виглядало б це як «вебмейл загубив файл».
+  roundcube-temp:
+
+services:
+
+  mysql:
+    image: mariadb:latest
+    container_name: ${GROUP_NAME}-mysql
+    restart: unless-stopped
+    <<: *group-hosts
+    environment:
+      <<: *tz
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_MAIL_DB:-mailserver}
+      MYSQL_USER: ${MYSQL_MAIL_USER:-mailuser}
+      MYSQL_PASSWORD: ${MYSQL_MAIL_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ${GROUP_CONFIG_DIR}/mysql-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.20
+
+  postgrey:
+    image: mail/postgrey:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-postgrey
+    # Ім'я вузла їде в ЗАГОЛОВОК доставленого листа:
+    # `X-Greylist: delayed N seconds by postgrey-1.37 at <hostname>`.
+    # Без цього рядка там був випадковий ID контейнера — третій такий
+    # випадок після clamav і spamassassin.
+    #
+    # Postgrey має й власний `--hostname=NAME`, але беремо той самий
+    # механізм, що в двох інших, щоб правило було одне:
+    # ім'я вузла сервісу = <група>-<сервіс>. Чому не ${MAIL_HOSTNAME} —
+    # у коментарі до spamassassin вище.
+    hostname: ${GROUP_NAME}-postgrey
+    restart: unless-stopped
+    <<: *group-hosts
+    environment:
+      <<: *tz
+      # Затримка й термін життя записів — параметри ГРУПИ, бо рішення
+      # №21 передбачає підкручування після статистики. Дефолти 20/60 —
+      # не пакетні (ті 300/35), а ті, що стояли й на office, і на
+      # isp; обґрунтування в entrypoint.
+      GREYLIST_DELAY: ${GREYLIST_DELAY:-20}
+      GREYLIST_MAX_AGE: ${GREYLIST_MAX_AGE:-60}
+    volumes:
+      - postgrey-db:/var/lib/postgrey
+      # Пакетні whitelist-и НЕ чіпаємо; свої додавання — у *.local
+      # (пакетна конвенція, див. entrypoint). Спільні плюс перекриття
+      # групи, як у решти сервісів — _configs/README.md.
+      - ../_configs/postgrey:/etc/postgrey/shared:ro
+      - ${GROUP_CONFIG_DIR}/postgrey-config:/etc/postgrey/config:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.32
+    expose:
+      - "10023"
+
+  opendkim:
+    image: mail/opendkim:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-opendkim
+    restart: unless-stopped
+    <<: *group-hosts
+    environment:
+      <<: *tz
+      # Список доменів для підпису entrypoint читає з БД: KeyTable і
+      # SigningTable генеруються, а не правляться руками (мета проєкту).
+      MYSQL_HOST: mysql
+      MYSQL_DB: ${MYSQL_MAIL_DB:-mailserver}
+      MYSQL_USER: ${MYSQL_MAIL_USER:-mailuser}
+      MYSQL_PASSWORD: ${MYSQL_MAIL_PASSWORD}
+      # AuthservID — ім'я, яким підписується Authentication-Results.
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      # Селектор. РІЗНИЙ між групами (на джерелах теж різний), і при
+      # міграції краще взяти НОВИЙ: тоді старий DNS-запис живе далі, а
+      # новий публікується поруч, без вікна, коли запис не відповідає
+      # ключу.
+      DKIM_SELECTOR: ${DKIM_SELECTOR}
+      # Кого вважати «своїм» і підписувати, а не перевіряти: власна
+      # internal-мережа (звідти шле Roundcube) плюс довірені мережі
+      # групи. Див. InternalHosts в entrypoint.
+      INTERNAL_PREFIX: ${INTERNAL_PREFIX}
+      MYNETWORKS: ${MYNETWORKS:-}
+    volumes:
+      - dkim-keys:/etc/opendkim/keys
+      # Спільна база конфігів (_configs/) плюс перекриття групи.
+      # Entrypoint бере груповий файл, якщо він є, інакше спільний —
+      # і пише в лог, який саме взяв. Так правка в _configs/ діє на всі
+      # групи, а група лишається вільною перекрити що треба.
+      # Деталі й перелік того, що мусить лишатись у групі — _configs/README.md.
+      - ../_configs/opendkim:/etc/opendkim/shared:ro
+      - ${GROUP_CONFIG_DIR}/opendkim-config:/etc/opendkim/config:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.30
+    expose:
+      - "8891"
+
+  opendmarc:
+    image: mail/opendmarc:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-opendmarc
+    restart: unless-stopped
+    <<: *group-hosts
+    environment:
+      <<: *tz
+      # AuthservID і TrustedAuthservIDs — обидва з MAIL_HOSTNAME, і це
+      # не збіг: друге мусить дорівнювати AuthservID у OpenDKIM, який
+      # теж звідси. Збігається за конструкцією, а не за домовленістю —
+      # інакше OpenDMARC мовчки відкидав би наш же результат DKIM.
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      # Кого не оцінювати: своя internal-мережа плюс довірені мережі
+      # групи. Та сама логіка, що в InternalHosts у OpenDKIM.
+      INTERNAL_PREFIX: ${INTERNAL_PREFIX}
+      MYNETWORKS: ${MYNETWORKS:-}
+    volumes:
+      # /etc/opendmarc цілком НЕ монтуємо: entrypoint пише туди
+      # ignore.hosts, а bind-mount із репозиторію для цього не місце.
+      - ../_configs/opendmarc:/etc/opendmarc/shared:ro
+      - ${GROUP_CONFIG_DIR}/opendmarc-config:/etc/opendmarc/config:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.31
+    expose:
+      - "8893"
+
+  spamassassin:
+    image: mail/spamassassin:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-spamassassin
+    # Ім'я вузла потрапляє В ЗАГОЛОВКИ листа: `X-Spam-Checker-Version:
+    # ... on <hostname>` і `X-Virus-Scanned: ... at <hostname>`. Без
+    # цього рядка там опиняється випадковий ID контейнера
+    # (`b176be19754f`), який не каже нічого ні про групу, ні про сервіс.
+    #
+    # Чому НЕ ${MAIL_HOSTNAME}: це ім'я вже є в таблиці x-group-hosts і
+    # вказує на postfix (.10). Поставивши його ще й іменем ЦЬОГО
+    # контейнера, ми отримали б у /etc/hosts два записи з різними
+    # адресами — рівно той клас мовчазної неоднозначності, якого
+    # проєкт уникає. А `<група>-<сервіс>` збігається з container_name,
+    # тобто це вже наявний DNS-alias саме цього контейнера.
+    hostname: ${GROUP_NAME}-spamassassin
+    restart: unless-stopped
+    <<: *group-hosts
+    depends_on:
+      - mysql
+    environment:
+      <<: *tz
+      # Стан (bayes, AWL, userpref) — в ОКРЕМІЙ базі з ОКРЕМИМ
+      # користувачем (рішення №33). Не в поштовій: інакше сканер вмісту
+      # отримав би доступ до `usersdb`, тобто до хешів паролів усіх
+      # користувачів групи.
+      MYSQL_HOST: mysql
+      SA_DB: ${SA_DB:-spamassassin}
+      SA_DB_USER: ${SA_DB_USER:-spamd}
+      SA_DB_PASSWORD: ${SA_DB_PASSWORD}
+      # Домен для -e у spamass-milter: ключ per-user prefs — ПОВНА
+      # адреса (рішення №15), а без -e в spamc їде лише localpart.
+      # Беремо з POSTMASTER_ADDRESS, бо MAIL_HOSTNAME поштовим доменом
+      # не є — на цьому вже спіймались у Dovecot.
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS}
+      # Довірені мережі йдуть у -i: spamass-milter не відрізняє вхідну
+      # пошту від вихідної, тож без цього сканувалась би й пошта
+      # абонентів (рішення №31). Та сама логіка, що InternalHosts в
+      # OpenDKIM, і походить від того ж параметра групи.
+      MYNETWORKS: ${MYNETWORKS:-}
+      # DNSBL — параметр групи, бо користь від них залежить від того,
+      # чий резолвер бачить контейнер (свій рекурсивний чи публічний),
+      # а це властивість хоста. Деталі — у _configs/spamassassin/local.cf.
+      SA_DNSBL: ${SA_DNSBL:-yes}
+      # Потрібен для --allowed-ips у spamd: донавчання приходить від
+      # Dovecot, а він у netns постфікса (${INTERNAL_PREFIX}.10), тобто
+      # для spamd це НЕ loopback. Обґрунтування — рішення №34 і
+      # коментар в entrypoint.
+      INTERNAL_PREFIX: ${INTERNAL_PREFIX}
+    volumes:
+      # Спільна база конфігів плюс перекриття групи — _configs/README.md.
+      - ../_configs/spamassassin:/etc/spamassassin/shared:ro
+      - ${GROUP_CONFIG_DIR}/spamassassin-config:/etc/spamassassin/config:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.33
+    # 8894 — мілтер (його питає Postfix), 783 — spamd.
+    #
+    # 783 з'явився тут разом із донавчанням (рішення №34): Dovecot
+    # живе в netns постфікса, тож для spamd він НЕ loopback і мусить
+    # мати до нього мережевий шлях. Доступ ріже ACL самого spamd
+    # (--allowed-ips = loopback плюс адреса постфікса), а не те, що
+    # мережа внутрішня. Назовні жоден із двох не публікується.
+    expose:
+      - "8894"
+      - "783"
+
+  # ClamAV — антивірус (рішення №32). Мілтером, а не clamsmtpd, яким це
+  # зроблено на джерелах: content_filter спрацьовує ПІСЛЯ прийому
+  # листа, тобто відмовити відправнику вже неможливо, і лишається або
+  # тихо викинути, або згенерувати bounce на підроблену зворотну
+  # адресу. Мілтер відмовляє під час сесії.
+  #
+  # Три процеси в одному контейнері (clamd, freshclam, clamav-milter) —
+  # свідомо: freshclam мусить писати в той самий том, який clamd читає,
+  # а мілтер без clamd безсилий. Нагляд в entrypoint: помер будь-який —
+  # контейнер виходить, і restart його підіймає.
+  #
+  # ПАМ'ЯТЬ: clamd тримає базу в RAM, це близько гігабайта НА ГРУПУ.
+  # Спільний на хост суперечив би ізоляції (рішення №4) і зламався б
+  # при рознесенні груп на різні машини. У clamd.conf через це стоїть
+  # ConcurrentDatabaseReload no — з дефолтним `yes` пік подвоюється.
+  clamav:
+    image: mail/clamav:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-clamav
+    # Те саме, що в spamassassin вище: ім'я їде в X-Virus-Scanned.
+    hostname: ${GROUP_NAME}-clamav
+    restart: unless-stopped
+    <<: *group-hosts
+    environment:
+      <<: *tz
+    volumes:
+      - clamav-db:/var/lib/clamav
+      - ../_configs/clamav:/etc/clamav/shared:ro
+      - ${GROUP_CONFIG_DIR}/clamav-config:/etc/clamav/config:ro
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.34
+    # Лише мілтер; clamd на 127.0.0.1:3310 всередині контейнера.
+    expose:
+      - "7357"
+
+  # Postfix — "власник" мережевої IP групи: єдиний, хто явно підключений
+  # до public (ipvlan) з фіксованою адресою. Dovecot нижче не отримує
+  # власної IP — він приєднується до ЦЬОГО Ж мережевого namespace
+  # (network_mode: service:postfix), тому слухає ту саму білу адресу на
+  # своїх портах. Це і є "вся пошта групи на одній IP":
+  # smtp/pop3/imap/sieve — все на ${PUBLIC_IP}.
+  # Roundcube з цього netns свідомо винесений (див. нижче) — webmail
+  # віддає спільний nginx, а не біла адреса групи.
+  #
+  # Postfix — власник /etc/hosts і /etc/resolv.conf свого netns, тому
+  # x-group-hosts тут прописані один раз і на себе, і на dovecot.
+  postfix:
+    image: mail/postfix:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-postfix
+    restart: unless-stopped
+    # NB: тут БУЛО `hostname: ${MAIL_HOSTNAME}`, і це коштувало втраченої
+    # пошти 23.11.2026. Docker реєструє hostname контейнера у вбудованому
+    # DNS, а `mailstack-public` СПІЛЬНА на хост (рішення №24) — тобто в
+    # ній зустрічаються постфікси всіх груп. Отже isp питав
+    # `mail.office.example.com` у 127.0.0.11, отримував адресу office-postfix у
+    # спільній мережі (203.0.113.84) і до публічного DNS не доходив.
+    # Поки MX групи вже вказує на неї, локальна відповідь дорівнює
+    # публічній і шкоди немає. Рівно один стан небезпечний — група
+    # ПІДНЯТА, а MX ще не на ній (office між фазою 1 і фазою 3): тоді
+    # сусідня група доставляє в стек, якого світ ще не бачить, і лист
+    # лягає в скриньку, якої ніхто не читає.
+    # Ім'я вузла постфіксу й так приходить змінною MAIL_HOSTNAME нижче
+    # (entrypoint ставить myhostname явно, бо /etc/hostname у netns один
+    # на двох), а dovecot отримує її тим самим шляхом — `hostname:` на
+    # ньому заборонений конфліктом із network_mode. Тобто для обох
+    # сервісів це поле було косметичним.
+    # Заразом зникає друга неоднозначність: те саме ім'я стояло і в
+    # x-group-hosts (-> .10), і як hostname контейнера (-> його адреса),
+    # тобто в /etc/hosts було два записи з різними адресами — рівно те,
+    # через що `hostname:` на spamassassin свідомо НЕ MAIL_HOSTNAME.
+    hostname: ${GROUP_NAME}-postfix
+    <<: *group-hosts
+    depends_on:
+      - mysql
+      - postgrey
+      - opendkim
+      - opendmarc
+      - spamassassin
+      - clamav
+      # dovecot свідомо НЕ в depends_on: dovecot тепер сидить у netns
+      # постфікса (нижче), тому залежність була б циклічною. LMTP-доставка
+      # стійка до того, що Dovecot підніметься на секунду пізніше.
+    environment:
+      <<: *tz
+      MYSQL_HOST: mysql
+      MYSQL_DB: ${MYSQL_MAIL_DB:-mailserver}
+      MYSQL_USER: ${MYSQL_MAIL_USER:-mailuser}
+      MYSQL_PASSWORD: ${MYSQL_MAIL_PASSWORD}
+      # Вихідна пошта мусить йти З білої адреси групи, інакше вона піде
+      # дефолтним маршрутом через internal-bridge і назовні вилізе під IP
+      # хоста — повз rDNS і SPF групи. Тому в main.cf піде
+      # smtp_bind_address = ${PUBLIC_IP} (і smtp_bind_address6 для IPv6),
+      # а не надія на порядок маршрутів. Адресу передаємо в контейнер,
+      # щоб entrypoint підставив її в конфіг.
+      #
+      # PUBLIC_IP і LISTEN_ADDRESSES приходять із ЗГЕНЕРОВАНОГО
+      # groups/<group>/.compose.env, а не з group.env: перша — адреса
+      # мережі PRIMARY_NET, друга — всі зовнішні адреси групи через
+      # пробіл (для inet_interfaces у Postfix і listen у Dovecot).
+      # Руками їх не задають, щоб вони не розійшлися з ADDRESSES.
+      PUBLIC_IP: ${PUBLIC_IP}
+      LISTEN_ADDRESSES: ${LISTEN_ADDRESSES}
+      # Потрібен, щоб Postfix слухав і на internal-адресі: інакше
+      # Roundcube (він поза netns за рішенням №5) не має шляху до
+      # submission. Парний до того самого в dovecot — вони ділять
+      # netns, і забути один із двох легко: вхід у вебмейл тоді
+      # працює, а відправка падає.
+      INTERNAL_PREFIX: ${INTERNAL_PREFIX}
+      # ДОВІРЕНІ мережі — параметр групи, і з ADDRESSES він НЕ виводиться
+      # (рішення №30): office має офісну адресу й довіряє офісній мережі,
+      # small має ту саму офісну мережу й НЕ довіряє їй. Порожнє
+      # значення — нормальний випадок: лишається лише loopback.
+      MYNETWORKS: ${MYNETWORKS:-}
+      # Вимикач greylisting-у. Дефолт yes, але вимикач потрібен:
+      # `check_policy_service` на мертвий сервіс означає 451 на ВСЮ
+      # пошту, а рішення №21 вимагає вмикати фільтрацію на
+      # isp-подібній групі поетапно.
+      GREYLIST: ${GREYLIST:-yes}
+      # Дія pregreet-тесту postscreen (рішення №13). Дефолт Postfix —
+      # лише лог; нам потрібна відмова, але на isp-подібній групі
+      # спершу статистика (рішення №21), тож це параметр групи.
+      POSTSCREEN_ACTION: ${POSTSCREEN_ACTION:-enforce}
+      # Ліміти anvil на клієнтську адресу (рішення №13, третя частина).
+      # Самі числа — в main.cf; тут лише те, що залежить від групи.
+      # ANVIL=no обнуляє їх усі: перший етап для isp-подібної групи,
+      # де спершу дивляться статистику з логу anvil (рішення №21).
+      ANVIL: ${ANVIL:-yes}
+      # Кому ліміти НЕ діють. Порожнє — нормальний випадок: лишається
+      # лише loopback, який entrypoint додає сам.
+      # УВАГА: це НЕ те саме, що MYNETWORKS, хоч формат однаковий.
+      # MYNETWORKS дає право релею без SASL, ANVIL_EXCEPTIONS знімає
+      # ліміти. Дефолт Postfix для другого — `$mynetworks`, тобто він
+      # їх ототожнює; ми від цього свідомо відходимо, бо інакше anvil
+      # не діяв би саме на довірених мережах (рішення №20, №30).
+      ANVIL_EXCEPTIONS: ${ANVIL_EXCEPTIONS:-}
+      # FQDN вузла — ЄДИНЕ його джерело для пари postfix+dovecot.
+      # В `hostname:` го БІЛЬШЕ НЕМАЄ (див. NB вище: там воно
+      # попадало у вбудований DNS і перебивало публічний для сусідніх
+      # груп). /etc/hostname у netns один на двох, а myhostname мусить
+      # бути явним, тож entrypoint читає саме цю змінну.
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      # Адреса для власних повідомлень Postfix (bounce/error/delay) і
+      # джерело mydomain: локальної доставки тут немає, тож `postmaster`
+      # без домену нікуди б не привів.
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS}
+    volumes:
+      # Монтуємо ПОЗА /etc/postfix, і це не косметика: Postfix рекурсивно
+      # перевіряє власний каталог і лається на все, що не належить root
+      # або доступне на запис групі/іншим — а bind-mount із репозиторію
+      # належить користувачу хоста. Попередження не фатальні, але вони
+      # сиплються при кожному старті й маскують справжні. У Dovecot цієї
+      # перевірки немає, тому там монтування лишилось у /etc/dovecot.
+      # Спільна база конфігів (_configs/) плюс перекриття групи.
+      # Entrypoint бере груповий файл, якщо він є, інакше спільний —
+      # і пише в лог, який саме взяв. Так правка в _configs/ діє на всі
+      # групи, а група лишається вільною перекрити що треба.
+      # Деталі й перелік того, що мусить лишатись у групі — _configs/README.md.
+      - ../_configs/postfix:/etc/postfix-shared:ro
+      - ${GROUP_CONFIG_DIR}/postfix-config:/etc/postfix-custom:ro
+      # Рішення №8: том у /var/mail, на рівень вище, ніж було — див.
+      # коментар у сервісі dovecot.
+      - vmail-data:/var/mail
+      # Сертифікат. Той САМИЙ том, що й у dovecot: пошта групи живе на
+      # одному наборі адрес (рішення №5), отже й сертифікат у неї один.
+      # Шлях усередині — той, який уже стоїть у main.cf, тож поява
+      # справжнього сертифіката конфігів не змінює.
+      - tls-certs:/etc/postfix/tls
+      # ЧЕРГА. Том, а не шар контейнера — і це не оптимізація, а
+      # збереження пошти.
+      #
+      # `mailctl reload` робить `up -d --force-recreate`, тобто ЗНИЩУЄ
+      # контейнер. Без тому разом із ним зникало б усе, що лежить у
+      # `deferred` і `active`: лист, якого приймальна сторона щойно
+      # відклала на 4xx, лист до сервера, що лежить, лист, затриманий
+      # greylisting-ом на боці отримувача. На групі з дев'ятьма
+      # скриньками це губилось незаміченим; на isp черга не буває
+      # порожньою.
+      #
+      # Структуру черги при старті перевіряє сам `postfix check` у
+      # entrypoint: відсутні каталоги він створює, тож свіжий (порожній)
+      # том наповнюється коректно — Docker спершу копіює в нього вміст
+      # образу з правами, а check дороблює решту.
+      - postfix-spool:/var/spool/postfix
+      # $data_directory. Тут лежить `verify` — кеш перевірки отримувачів
+      # (рішення №39). Саме ПОЗИТИВНИЙ кеш робить резервний MX робочим
+      # під час аварії основного сервера, тож зникати на кожному reload
+      # він не має права: інакше він порожній рівно тоді, коли потрібен.
+      # Поруч `prng_exch` — стан генератора випадкових чисел TLS.
+      - postfix-data:/var/lib/postfix
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.10
+        # Нижчий gw_priority: internal НЕ має бути дефолтним маршрутом.
+        # Інакше вихідна пошта піде через bridge під NAT-адресою хоста —
+        # повз rDNS і SPF групи. Виграє більше значення.
+        #
+        # Зовнішні підключення (з їхніми ipv4_address і вищими
+        # gw_priority) додає згенерований networks.yml — див. коментар
+        # у `networks:` нижче. Дефолтний маршрут отримує мережа, названа
+        # PRIMARY_NET у group.env; це ПОЛОВИНА рішення про вихідну
+        # адресу, друга половина — smtp_bind_address = ${PUBLIC_IP} у
+        # main.cf. Одне без одного не працює: bind без маршруту дає
+        # пакети з чужим для підмережі source, маршрут без bind —
+        # правильний інтерфейс, але не гарантовану адресу.
+        gw_priority: 10
+    # порт 25/587/465 НЕ публікуємо через ports: — вони й так слухають
+    # напряму на білій IP групи через ipvlan (без NAT, без колізій портів
+    # між групами, бо в кожної своя адреса).
+
+  dovecot:
+    image: mail/dovecot:${IMAGE_TAG:-trixie}
+    container_name: ${GROUP_NAME}-dovecot
+    restart: unless-stopped
+    depends_on:
+      - postfix
+      - mysql
+    # ділить мережевий namespace з postfix -> та сама IP (${PUBLIC_IP}):
+    # POP3/IMAP/ManageSieve мусять бути на білій адресі групи.
+    # Своя networks: секція тут неможлива й не потрібна.
+    # extra_hosts тут ТЕЖ неможливі (див. x-group-hosts вгорі) — імена
+    # приходять з /etc/hosts постфікса, DNS — з його ж resolv.conf.
+    network_mode: "service:postfix"
+    environment:
+      <<: *tz
+      MYSQL_HOST: mysql
+      MYSQL_DB: ${MYSQL_MAIL_DB:-mailserver}
+      MYSQL_USER: ${MYSQL_MAIL_USER:-mailuser}
+      MYSQL_PASSWORD: ${MYSQL_MAIL_PASSWORD}
+      # Ті самі адреси, що й у постфікса: Dovecot ділить із ним netns,
+      # тож слухати мусить рівно те саме.
+      LISTEN_ADDRESSES: ${LISTEN_ADDRESSES}
+      # Потрібен, щоб Dovecot слухав і на internal-адресі: інакше
+      # Roundcube (він поза netns за рішенням №5) не має жодного шляху
+      # до IMAP. Обґрунтування — в entrypoint, блок про listen.
+      INTERNAL_PREFIX: ${INTERNAL_PREFIX}
+      # FQDN вузла. Dovecot у netns постфікса, і `hostname:` на ньому
+      # задати НЕ можна (конфлікт із network_mode) — тож ім'я приходить
+      # змінною, а не з /etc/hostname. Йде в Received-заголовки, у
+      # postmaster_address і в CN самопідписаного сертифіката-заглушки.
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      # Адреса, від якої Dovecot шле власні відмови (over-quota, vacation).
+      # Мусить бути РЕАЛЬНОЮ скринькою в домені групи: з MAIL_HOSTNAME її
+      # складати не можна, бо mail.<домен> поштовим доменом не є.
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS}
+      # Власник скриньок — числами, бо між групами різні й числа, й
+      # імена користувачів (рішення №8). Entrypoint ставить із них
+      # mail_uid/mail_gid і first_valid_uid/gid: без другого Dovecot
+      # відмовить групі з uid 8, бо дефолт first_valid_uid = 500.
+      VMAIL_UID: ${VMAIL_UID}
+      VMAIL_GID: ${VMAIL_GID}
+      # Мережі, з яких дозволено автентифікацію БЕЗ TLS (рішення №14,
+      # уточнення 2026-11-13). Порожнє за замовчуванням — тобто TLS
+      # обов'язковий, як і було. Дефолт `:-` обов'язковий: без нього
+      # compose сипле попередження на КОЖНУ команду.
+      CLEARTEXT_NETWORKS: ${CLEARTEXT_NETWORKS:-}
+      # Чи дозволені СЛАБКІ схеми зберігання паролів (MD5-CRYPT,
+      # DES-CRYPT). Дефолт `no` — як у самого Dovecot 2.4, тобто
+      # поведінка без параметра не змінюється. Потрібен при міграції
+      # джерел, де історичні хеші саме такі (рішення №25).
+      AUTH_ALLOW_WEAK_SCHEMES: ${AUTH_ALLOW_WEAK_SCHEMES:-no}
+      # Скільки redirect дозволено одному sieve-скрипту. Дефолт 4 — той
+      # самий, що в Pigeonhole, тобто поведінка без параметра не
+      # змінюється. Значення задається ТУТ і тільки тут: entrypoint
+      # власного дефолту не має, бо дві копії розійшлися б мовчки.
+      SIEVE_MAX_REDIRECTS: ${SIEVE_MAX_REDIRECTS:-4}
+      # Чи розкладати спам у Junk ГЛОБАЛЬНО, before-скриптом, ДО
+      # користувацьких правил. Дефолт no — тобто для наявних груп нічого
+      # не змінюється. Рядок мусить бути ТУТ: env_file шаблон не
+      # використовує, тож змінна, якої немає в environment, доходить до
+      # entrypoint порожньою — рівно так CLEARTEXT_NETWORKS був мертвим
+      # кодом (PITFALLS).
+      SPAM_TO_JUNK: ${SPAM_TO_JUNK:-no}
+    volumes:
+      # Спільна база конфігів (_configs/) плюс перекриття групи.
+      # Entrypoint бере груповий файл, якщо він є, інакше спільний —
+      # і пише в лог, який саме взяв. Так правка в _configs/ діє на всі
+      # групи, а група лишається вільною перекрити що треба.
+      # Деталі й перелік того, що мусить лишатись у групі — _configs/README.md.
+      - ../_configs/dovecot:/etc/dovecot/shared:ro
+      - ${GROUP_CONFIG_DIR}/dovecot-config:/etc/dovecot/custom:ro
+      # Рішення №8: том у /var/mail, а НЕ на рівень глибше. Скринька
+      # лежить у /var/mail/<домен>/<localpart>, і те саме значення
+      # приходить із БД як home у mail_path = %{home}. Зайвий рівень
+      # розсинхронізував би том із тим, що каже база.
+      #
+      # Окремого тому під sieve немає свідомо: активний скрипт і набір
+      # include-ів лежать у ~/sieve/, тобто вже в цьому ж томі, а
+      # ГЛОБАЛЬНИЙ sieve — це конфіг, і його місце в dovecot-config
+      # (read-only), а не в томі зі станом.
+      - vmail-data:/var/mail
+      # Сертифікат — той самий том, що й у постфікса (див. там).
+      - tls-certs:/etc/dovecot/tls
+    # 110/995/143/993/4190 слухають напряму на ${PUBLIC_IP} — окремий
+    # ports: тут не діє (порти публікує власник netns), і не потрібен:
+    # ipvlan вже дає пряму L3-присутність без NAT.
+
+  # Roundcube — ЄДИНИЙ сервіс групи, що НЕ дивиться на ${PUBLIC_IP}.
+  # Він живе звичайним контейнером на internal, а назовні його віддає
+  # спільний nginx (окремий контейнер на хості, поза цим стеком), який
+  # маршрутизує за Host: у Roundcube потрібної групи. Тому:
+  #   - network_mode: service:postfix тут НЕ використовується — інакше
+  #     Roundcube успадкував би netns постфікса й слухав :80 і на білій
+  #     адресі теж, тобто був би доступний повз nginx;
+  #   - ports: не публікуємо — доступ тільки з internal групи;
+  #   - nginx підключається до internal кожної групи і ходить сюди за
+  #     ім'ям/адресою ${INTERNAL_PREFIX}.50. Це єдиний погоджений виняток
+  #     з мережевої ізоляції групи.
+  # Пошти це не стосується: SMTP/POP3/IMAP/ManageSieve як були на
+  # ${PUBLIC_IP}, так і лишаються (postfix + dovecot вище).
+  roundcube:
+    # Пін на лінію 1.7.x, а не latest. За README образу теги виду
+    # `1.7.x` оновлюються в межах мінора (виправлення приїжджають), а
+    # повні версії (`1.7.4`) не оновлюються взагалі. `latest` одного
+    # дня привіз би мажор із іншим конфігом — мовчки, при черговому
+    # `up`. Рішення №1 це не порушує: образ лишається офіційним.
+    # НАШ образ, а не офіційний напряму: у нього доданий плагін
+    # sauserprefs, якого в офіційному немає (звірено `ls plugins`).
+    # База лишається офіційною — див. _images/roundcube/Dockerfile, там
+    # і причина, чому не ROUNDCUBEMAIL_COMPOSER_PLUGINS.
+    # Тег ЗБІГАЄТЬСЯ з лінією бази й виводиться build.sh з FROM.
+    image: mail/roundcube:1.7.x
+    container_name: ${GROUP_NAME}-roundcube
+    restart: unless-stopped
+    <<: *group-hosts
+    depends_on:
+      - mysql
+      - dovecot
+    networks:
+      internal:
+        ipv4_address: ${INTERNAL_PREFIX}.50
+    expose:
+      - "80"
+    environment:
+      <<: *tz
+      ROUNDCUBEMAIL_DB_TYPE: mysql
+      ROUNDCUBEMAIL_DB_HOST: mysql
+      # ┌─────────────────────────────────────────────────────────────┐
+      # │ ОКРЕМИЙ користувач БД, не поштовий. Тут раніше стояв        │
+      # │ ${MYSQL_MAIL_USER}, і це була справжня діра: той користувач │
+      # │ має SELECT на `usersdb`, тобто на ХЕШІ ПАРОЛІВ усіх         │
+      # │ користувачів групи. Рішення №33 уже відмовило в цьому       │
+      # │ SpamAssassin; Roundcube тут гірший за нього — він єдиний у  │
+      # │ стеку, кого видно назовні через проксі.                     │
+      # │ Права трьох користувачів — у 60-roundcube.sql.              │
+      # └─────────────────────────────────────────────────────────────┘
+      ROUNDCUBEMAIL_DB_USER: ${ROUNDCUBE_DB_USER:-roundcube}
+      ROUNDCUBEMAIL_DB_PASSWORD: ${ROUNDCUBE_DB_PASSWORD}
+      ROUNDCUBEMAIL_DB_NAME: ${ROUNDCUBE_DB:-roundcubemail}
+      # tls:// ОБОВ'ЯЗКОВИЙ, і не для галочки: у Dovecot
+      # auth_allow_cleartext = no (рішення №14), тобто PLAIN/LOGIN поза
+      # TLS не приймаються взагалі. Голий `dovecot:143` тут не
+      # автентикувався б, і виглядало б це як неправильний пароль.
+      # Ім'я, не адреса: ${MAIL_HOSTNAME} є в x-group-hosts і вказує на
+      # .10, тож CN сертифіката збігається з тим, куди ми ходимо.
+      ROUNDCUBEMAIL_DEFAULT_HOST: tls://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_DEFAULT_PORT: 143
+      ROUNDCUBEMAIL_SMTP_SERVER: tls://${MAIL_HOSTNAME}
+      ROUNDCUBEMAIL_SMTP_PORT: 587
+      # Усі, крім sauserprefs, — ВБУДОВАНІ в образ (звірено: ls plugins
+      # у контейнері). sauserprefs кладе туди НАШ Dockerfile.
+      #
+      # jqueryui — вимога sauserprefs (його README). У комплекті
+      # Roundcube він є, але перелічуємо явно: плагін, якого немає в
+      # цьому рядку, не завантажується, навіть якщо лежить у каталозі.
+      #
+      # password — це ручна операція №3 з мети проєкту: щоб користувач
+      # міняв пароль сам, а не просив адміна.
+      # markasjunk — кнопка «спам»; щоб вона СПРАВДІ вчила фільтр,
+      # потрібні markasjunk_move_* у _configs/roundcube/config.inc.php.
+      #
+      # Один рядок, не YAML-фолдинг: `>-` вставляє пробіли після ком.
+      # Образ їх зараз прощає (`sed -E "s/[, ]+/', '/g"` ловить і коми,
+      # і пробіли), але покладатись на це — залежність від чужої
+      # реалізації, яка зламається мовчки.
+      ROUNDCUBEMAIL_PLUGINS: "managesieve,password,markasjunk,sauserprefs,mailstack_identity,jqueryui,archive,zipdownload,acl,identicon,newmail_notifier,show_additional_headers,subscriptions_option,vcard_attachments,hide_blockquote"
+      ROUNDCUBEMAIL_SKIN: elastic
+      # ┌─────────────────────────────────────────────────────────────┐
+      # │ des_key ОБОВ'ЯЗКОВИЙ, і це не параноя.                      │
+      # │ Без нього образ генерує ключ сам (head /dev/urandom) при    │
+      # │ КОЖНОМУ створенні контейнера, бо /var/www/html не на томі.  │
+      # │ А session_storage у Roundcube — 'db', тобто сесії лежать у  │
+      # │ базі й переживають перестворення. Разом це дає: сесія є, а  │
+      # │ IMAP-пароль у ній уже не розшифровується.                   │
+      # │ 24 символи — вимога дефолтного cipher_method.               │
+      # └─────────────────────────────────────────────────────────────┘
+      ROUNDCUBEMAIL_DES_KEY: ${ROUNDCUBE_DES_KEY}
+      # Вкладення й тимчасові файли — на том (нижче). Без цього вони
+      # живуть у шарі контейнера й гинуть на кожному reload, посеред
+      # написаного листа.
+      ROUNDCUBEMAIL_TEMP_DIR: /var/roundcube/temp
+      ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: ${WEBMAIL_MAX_UPLOAD:-25M}
+      # Читаються НАШИМ config.inc.php через getenv(). Образ про них не
+      # знає — це не ROUNDCUBEMAIL_*.
+      WEBMAIL_FQDN: ${WEBMAIL_FQDN}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME}
+      # Адреса спільного nginx у мережі ЦІЄЇ групи. Статична за
+      # побудовою: її призначає `mailctl proxy attach`.
+      PROXY_IP: ${INTERNAL_PREFIX}.100
+      # Окремий DSN для плагіна password: інший користувач, інші права.
+      ROUNDCUBE_PASSWD_DSN: mysql://${ROUNDCUBE_PASSWD_USER:-rcpasswd}:${ROUNDCUBE_DB_PASSWORD}@mysql/${MYSQL_MAIL_DB:-mailserver}
+      # Окремий DSN для sauserprefs: третій користувач, права рівно на
+      # таблицю `userpref` бази СТАНУ SpamAssassin (рішення №33). До
+      # bayes_* і до поштових таблиць доступу немає.
+      # База тут ІНША, ніж у двох DSN вище, — не поштова.
+      ROUNDCUBE_PREFS_DSN: mysql://${ROUNDCUBE_PREFS_USER:-rcprefs}:${ROUNDCUBE_DB_PASSWORD}@mysql/${SA_DB:-spamassassin}
+    volumes:
+      # БЕЗ підкаталогу. Образ читає `ls /var/roundcube/config/*.php`,
+      # тобто без рекурсії — конфіг у config/custom не читався МОВЧКИ.
+      # :ro безпечний: у цей каталог образ лише ЗАГЛЯДАЄ (grep -qr для
+      # enigma), а пише він у /var/www/html/config/.
+      - ../_configs/roundcube:/var/roundcube/config:ro
+      - roundcube-temp:/var/roundcube/temp
