@@ -1,0 +1,39 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────
+#  Викликається Dovecot через vnd.dovecot.pipe з report-spam.sieve /
+#  report-ham.sieve. Лист приходить на STDIN.
+#
+#  Рішення №34: навчання йде в НАЯВНИЙ spamd контейнера spamassassin,
+#  а не в локальний sa-learn. Тут немає ні SpamAssassin, ні доступу до
+#  його бази стану — лише клієнт.
+#
+#  УВАГА: адреса й порт тут ЗАШИТІ, і це не недогляд.
+#  sieve_extprograms передає прямо запущеній програмі лише HOME, USER,
+#  HOST, SENDER, RECIPIENT і ORIG_RECIPIENT — жодних наших змінних
+#  середовища тут не буде. А `spamassassin` і 783 задані шаблоном
+#  compose (ім'я сервісу й порт spamd), тобто довільними НЕ є: якщо їх
+#  міняти, міняти в _template/docker-compose.yml і тут одночасно.
+# ─────────────────────────────────────────────────────────────────────
+set -eu
+
+SA_HOST=spamassassin
+SA_PORT=783
+
+type=${1:-}
+user=${2:-}
+
+case "$type" in
+    spam|ham) ;;
+    *) echo "spamc-learn: перший аргумент мусить бути spam або ham, а не '$type'" >&2
+       exit 1 ;;
+esac
+
+if [ -z "$user" ]; then
+    echo "spamc-learn: другий аргумент (кого вчимо) порожній" >&2
+    exit 1
+fi
+
+# -L <тип> — навчання (підтверджено `spamc -h` у цьому ж образі).
+# Вивід spamc нам не потрібен: sieve однаково його не читає, а в лог
+# він ішов би на кожен перекладений лист.
+exec spamc -d "$SA_HOST" -p "$SA_PORT" -u "$user" -L "$type" >/dev/null
