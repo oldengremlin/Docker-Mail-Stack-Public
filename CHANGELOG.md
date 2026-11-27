@@ -4,6 +4,14 @@ This repository receives periodic exports from a private working
 repository (see "About this repository" in the README). Each entry here is
 one export; `.public-sync/state` holds the exact source revision.
 
+## Export 2 — 2026-11-27
+
+- `mailctl config <group> <service>` passes every known variable to the
+  one-shot container, with the same defaults as the Compose template.
+  It used to pass a hand-maintained list per service, which had drifted
+  from the entrypoints: `config <group> dovecot` failed on variables
+  added later.
+
 ## Export 1 — 2026-11-27
 
 First public export. The stack as it runs in production for several

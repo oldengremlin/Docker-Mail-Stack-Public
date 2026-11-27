@@ -1587,10 +1587,40 @@ sub cmd_config {
         SA_DB_USER         => $c->{env}{SA_DB_USER}          // 'spamd',
         SA_DB_PASSWORD     => $c->{env}{SA_DB_PASSWORD}      // '',
         SA_DNSBL           => $c->{env}{SA_DNSBL}            // 'yes',
+        # Дефолти ТІ САМІ, що в _template/docker-compose.yml. Вони
+        # потрібні саме тут, бо одноразовий `docker run` йде БЕЗ
+        # compose, тобто форма `${VAR:-дефолт}` до нього не доходить
+        # взагалі: змінна, якої немає в group.env, приїхала б порожня.
+        CLEARTEXT_NETWORKS      => $c->{env}{CLEARTEXT_NETWORKS}      // '',
+        AUTH_ALLOW_WEAK_SCHEMES => $c->{env}{AUTH_ALLOW_WEAK_SCHEMES} // 'no',
+        SIEVE_MAX_REDIRECTS     => $c->{env}{SIEVE_MAX_REDIRECTS}     // '4',
+        SPAM_TO_JUNK            => $c->{env}{SPAM_TO_JUNK}            // 'no',
+        GREYLIST                => $c->{env}{GREYLIST}                // 'yes',
+        GREYLIST_DELAY          => $c->{env}{GREYLIST_DELAY}          // '20',
+        GREYLIST_MAX_AGE        => $c->{env}{GREYLIST_MAX_AGE}        // '60',
+        ANVIL                   => $c->{env}{ANVIL}                   // 'yes',
+        ANVIL_EXCEPTIONS        => $c->{env}{ANVIL_EXCEPTIONS}        // '',
+        TZ                      => $c->{env}{TZ}                      // 'UTC',
     );
+    # Передаємо ВСЄ, що знаємо, а НЕ список `$spec->{env}`.
+    #
+    # Той список був ТРЕТІИМ місцем, яке мусить узгоджуватись із
+    # entrypoint-ом і compose, і 27.11.2026 воно розійшлось: `config <g>
+    # dovecot` падав на `INTERNAL_PREFIX SIEVE_MAX_REDIRECTS
+    # AUTH_ALLOW_WEAK_SCHEMES` — трьох змінних, доданих у entrypoint
+    # ПІСЛЯ того, як цей список писався. Зламалось не сьогодні,
+    # а 16 листопада — просто досі ніхто не кликав `config`.
+    #
+    # Асиметрія цін: ЗАЙВА змінна в одноразовому контейнері
+    # нікому не шкодить (entrypoint читає ті, що знає), а ВІДСУТНЯ
+    # ламає саме той інструмент, яким діагностують інші поломки —
+    # і саме тоді, коли він найпотрібніший.
+    #
+    # `$spec->{env}` лишається в таблиці як довідка про те, що
+    # сервісу справді потрібно, але не як ФІЛЬТР.
     my @envargs;
-    for my $k (@{ $spec->{env} }) {
-        $ENV{$k} = $val{$k} // '';
+    for my $k (sort keys %val) {
+        $ENV{$k} = defined $val{$k} ? $val{$k} : '';
         push @envargs, '-e', $k;
     }
 

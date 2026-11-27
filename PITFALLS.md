@@ -65,6 +65,12 @@ know why those guards exist.
   `environment:` reaches the entrypoint empty, and an empty optional value
   usually means "feature off". Add every new parameter to the template,
   not only to `group.env`.
+- **A one-shot `docker run` gets no Compose defaults.** `${VAR:-x}`
+  lives in the template; a container started without Compose receives
+  an unset variable as empty. Every place that starts containers outside
+  Compose (here: `mailctl config`) must carry the defaults itself, and
+  must not filter variables through a separate list — a third list that
+  has to agree with the template and the entrypoint drifts silently.
 - **File permissions inside init directories.** MariaDB runs init scripts
   as the `mysql` user; a `0600` SQL file owned by you is unreadable to it,
   and the failure cascades into unrelated-looking errors elsewhere.
