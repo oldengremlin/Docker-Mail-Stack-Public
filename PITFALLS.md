@@ -211,6 +211,70 @@ know why those guards exist.
   bytes from `@ARGV` double-encodes them in the column; `mailctl`
   converts at the boundary.
 
+## Migrating Maildir from a live server
+
+Learned while moving three production servers onto this stack. The
+migration tooling itself is not part of this repository, but the
+traps are the same for any tool.
+
+- **"Stopped" does not mean stopped.** Old servers often have a cron
+  watchdog that restarts mail services whose processes are missing.
+  `systemctl stop` + `is-active` = `inactive`, and a minute later
+  everything runs again — your "final" copy is then taken from a live
+  source, and the only symptom is "file changed as we read it" noise
+  that looks normal. Find and disable the watchdog right before
+  stopping (`grep -r restart /etc/cron* /usr/local/bin`,
+  `systemctl list-timers`), and check **after 90 seconds, by
+  processes**, not by unit state.
+- **A "before" snapshot ages.** Comparing the copy against a snapshot
+  taken days earlier never matches. Differences in **both** directions
+  (folders shrinking from POP3 deletes, others growing) mean you are
+  comparing different moments, not different copies; a one-sided
+  shortfall means loss. The snapshot used as the acceptance criterion
+  must be taken from the stopped source at the time of the last pass.
+- **The copy unit sets the price of a delta.** Re-copying whole
+  folders that changed means one new message in a 2 GB folder costs
+  2 GB, and shrinking the time window does not help. In Maildir the
+  unit can be the file: a delivered message never changes, a state
+  change renames it (`new/X` -> `cur/X:2,S`). Comparing name lists on
+  both sides gives the exact difference without checksums. The only
+  mutable files are `dovecot-uidlist`, `maildirfolder`,
+  `subscriptions`. Convergence of repeated passes is a measured number,
+  not a property of the plan.
+- **An interrupted pass that wipes before copying leaves an EMPTY
+  folder**, not a stale one — it looks like a legitimately empty
+  mailbox. After any killed pass, re-copy the affected folders
+  completely before comparing.
+- **Comparing by names misses a truncated file.** A `tar` killed
+  mid-file leaves a partly written message with a correct name. Message
+  counts match; only **byte totals** reveal it. Acceptance must compare
+  bytes, not just counts.
+- **Keep `dovecot-uidlist`.** Index files can be deleted after the
+  copy (they are rebuilt), but `dovecot-uidlist` holds message UIDs and
+  UIDVALIDITY (the `V…` on its first line; `dovecot-uidvalidity` in the
+  home is only a generator counter). Lose it and every IMAP client
+  downloads every mailbox again. `doveadm mailbox status` takes fields
+  separated by spaces, not commas.
+- **Pipe-stdin traps in copy loops.** `while read …; do ssh …; done <
+  list` stops after one iteration because `ssh` eats the rest of the
+  list — and exits 0. Read the list from another descriptor
+  (`read … <&3`, `done 3< list`) or use `ssh -n` where stdin is not
+  needed. In `if a | b; then` only the last command's status counts;
+  use `PIPESTATUS` to tell a sender-side race from a receiver failure.
+- **`cd` before `sudo` in a remote command runs as the unprivileged
+  user** and silently fails on directories only root can enter. A
+  dry-run under root does not show this.
+- **Users' sieve scripts may be broken already.** `include` without
+  `require ["include"]` does not compile on 2.3 either, so the rules
+  never worked — but after a migration it looks like your defect.
+  Compile every active script with `sievec` right after switching.
+  **Do not use `sieve-test` where a script has `execute`/`pipe` inside
+  an `if`**: to evaluate the test, sieve must actually run the program.
+  "sieve-test only simulates" is true for `fileinto`, not for that.
+- **Control numbers must come from data, not estimates.** A
+  pre-computed "expected" count that was off by one went unnoticed
+  because the real result was recorded without comparing it.
+
 ## Method
 
 - **A check without a negative control proves nothing.** A guard that is

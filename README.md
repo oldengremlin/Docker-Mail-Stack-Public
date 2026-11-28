@@ -20,9 +20,10 @@ goal; if a change would add a fourth manual operation, it is the wrong
 change.
 
 > **Status.** This is a periodic public export of a stack that carries
-> production mail for several groups (a small domain group, an office,
-> and an ISP-style relay with a few hundred subscribers). The logic is
-> exercised in production; the documentation here is written against
+> production mail. Three existing non-containerized servers — a small
+> domain group, an office with its own LAN, and an ISP-style relay with
+> a few hundred subscribers — have been fully migrated onto it, plus a
+> separate backup-MX group. The documentation here is written against
 > hypothetical examples. See [About this repository](#about-this-repository).
 
 ## Contents

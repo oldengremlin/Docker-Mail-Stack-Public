@@ -10,6 +10,11 @@ they matter to someone running the stack.
 - **Translated code comments.** Comments are in Ukrainian; an English
   pass over the most important ones (`main.cf`, `dovecot.conf`, the
   Postfix and Dovecot entrypoints) would help.
+- **`health` undercounts `redirect`.** The "redirect headroom" section
+  counts `redirect` only in the active sieve file. If the active file
+  is just `include :personal "…"`, the real redirects live in included
+  scripts and are not counted — and exceeding `sieve_max_redirects`
+  fails the whole script. Counting must follow `include` recursively.
 - **`mailctl sieve <group> <email>`**: list scripts, show the active one,
   check every `fileinto` target against existing folders, show the tail
   of `~/sieve/.active.log`.

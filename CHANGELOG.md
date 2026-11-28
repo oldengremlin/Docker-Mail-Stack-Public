@@ -4,6 +4,20 @@ This repository receives periodic exports from a private working
 repository (see "About this repository" in the README). Each entry here is
 one export; `.public-sync/state` holds the exact source revision.
 
+## Export 3 — 2026-11-28
+
+No code changes since export 2. All three source servers are now
+migrated; documentation updated accordingly:
+
+- `PITFALLS.md`: new section "Migrating Maildir from a live server" —
+  watchdogs restarting a "stopped" source, stale snapshots, copy unit
+  vs. delta cost, empty folders after an interrupted wiping pass,
+  truncated files invisible to name-based comparison, keeping
+  `dovecot-uidlist`, stdin and pipe-status traps in copy loops,
+  pre-existing broken sieve scripts, `sieve-test` running `execute`.
+- `TODO.md`: `health` does not count `redirect` in included sieve
+  scripts.
+
 ## Export 2 — 2026-11-27
 
 - `mailctl config <group> <service>` passes every known variable to the
